@@ -17,15 +17,17 @@ contract Minter is Context, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.AddressSet;
 
     string public constant NAME = "VUSD-Minter";
-    string public constant VERSION = "1.4.1";
+    string public constant VERSION = "1.4.2";
 
     IVUSD public immutable vusd;
+    uint8 public immutable vusdDecimals;
 
     uint256 public mintingFee; // Default no fee
     uint256 public maxMintLimit; // Maximum VUSD can be minted
 
     uint256 public constant MAX_BPS = 10_000; // 10_000 = 100%
     uint256 public priceTolerance = 100; // 1% based on BPS
+    uint256 public stalePeriod = 1 days; // 1 day
 
     // Token => cToken mapping
     mapping(address => address) public cTokens;
@@ -52,6 +54,7 @@ contract Minter is Context, ReentrancyGuard {
 
     event UpdatedMintingFee(uint256 previousMintingFee, uint256 newMintingFee);
     event UpdatedPriceTolerance(uint256 previousPriceTolerance, uint256 newPriceTolerance);
+    event UpdatedStalePeriod(uint256 previousStalePeriod, uint256 newStalePeriod);
     event MintingLimitUpdated(uint256 previousMintLimit, uint256 newMintLimit);
     event Mint(
         address indexed tokenIn,
@@ -67,6 +70,7 @@ contract Minter is Context, ReentrancyGuard {
         require(_vusd != address(0), "vusd-address-is-zero");
         vusd = IVUSD(_vusd);
         maxMintLimit = _maxMintLimit;
+        vusdDecimals = IERC20Metadata(_vusd).decimals();
         // Add token into the list, add oracle and cToken into the mapping and approve cToken to spend token
         _addToken(DAI, cDAI, DAI_USD);
         _addToken(USDC, cUSDC, USDC_USD);
@@ -143,29 +147,31 @@ contract Minter is Context, ReentrancyGuard {
         priceTolerance = _newPriceTolerance;
     }
 
+    /// @notice Update stale period
+    function updateStalePeriod(uint256 _newStalePeriod) external onlyGovernor {
+        require(_newStalePeriod > 0, "stale-period-is-invalid");
+        uint256 _currentStalePeriod = stalePeriod;
+        require(_currentStalePeriod != _newStalePeriod, "same-stale-period");
+        emit UpdatedStalePeriod(_currentStalePeriod, _newStalePeriod);
+        stalePeriod = _newStalePeriod;
+    }
+
     ///////////////////////////////////////////////////////////////////////////
 
     /**
      * @notice Mint VUSD
      * @param _token Address of token being deposited
-     * @param _amountIn Amount of _token being sent to mint VUSD amount.
-     */
-    function mint(address _token, uint256 _amountIn) external nonReentrant {
-        _mint(_token, _amountIn, _msgSender());
-    }
-
-    /**
-     * @notice Mint VUSD
-     * @param _token Address of token being deposited
      * @param _amountIn Amount of _token
+     * @param _minAmountOut Minimum amount of VUSD to mint
      * @param _receiver Address of VUSD receiver
      */
     function mint(
         address _token,
         uint256 _amountIn,
+        uint256 _minAmountOut,
         address _receiver
     ) external nonReentrant {
-        _mint(_token, _amountIn, _receiver);
+        _mint(_token, _amountIn, _minAmountOut, _receiver);
     }
 
     /**
@@ -220,20 +226,6 @@ contract Minter is Context, ReentrancyGuard {
         address _oracle
     ) internal {
         require(_whitelistedTokens.add(_token), "add-in-list-failed");
-
-        uint8 _oracleDecimal = IAggregatorV3(_oracle).decimals();
-        (, int256 _price, , , ) = IAggregatorV3(_oracle).latestRoundData();
-        uint256 _latestPrice = uint256(_price);
-
-        // Token is expected to be stable coin only. Ideal price is 1 USD
-        uint256 _oneUSD = 10**_oracleDecimal;
-        uint256 _priceTolerance = (_oneUSD * priceTolerance) / MAX_BPS;
-        uint256 _priceUpperBound = _oneUSD + _priceTolerance;
-        uint256 _priceLowerBound = _oneUSD - _priceTolerance;
-
-        // Avoid accidentally add wrong oracle or non-stable coin.
-        require(_latestPrice <= _priceUpperBound && _latestPrice >= _priceLowerBound, "price-is-invalid");
-
         oracles[_token] = _oracle;
         cTokens[_token] = _cToken;
         IERC20(_token).safeApprove(_cToken, type(uint256).max);
@@ -249,6 +241,7 @@ contract Minter is Context, ReentrancyGuard {
     function _mint(
         address _token,
         uint256 _amountIn,
+        uint256 _minAmountOut,
         address _receiver
     ) internal returns (uint256 _mintage) {
         require(_whitelistedTokens.contains(_token), "token-is-not-supported");
@@ -258,6 +251,7 @@ contract Minter is Context, ReentrancyGuard {
 
         uint256 _actualAmountIn = _balanceAfter - _balanceBefore;
         _mintage = _calculateMintage(_token, _actualAmountIn);
+        require(_mintage >= _minAmountOut, "mint-amount-is-less-than-minimum");
         address _cToken = cTokens[_token];
 
         require(CToken(_cToken).mint(_balanceAfter) == 0, "cToken-mint-failed");
@@ -274,7 +268,8 @@ contract Minter is Context, ReentrancyGuard {
     function _calculateMintage(address _token, uint256 _amountIn) internal view returns (uint256 _mintage) {
         IAggregatorV3 _oracle = IAggregatorV3(oracles[_token]);
         uint8 _oracleDecimal = IAggregatorV3(_oracle).decimals();
-        (, int256 _price, , , ) = IAggregatorV3(_oracle).latestRoundData();
+        (, int256 _price, , uint256 _updatedAt, ) = IAggregatorV3(_oracle).latestRoundData();
+        require(block.timestamp - _updatedAt < stalePeriod, "oracle-price-is-stale");
         uint256 _latestPrice = uint256(_price);
 
         // Token is expected to be stable coin only. Ideal price is 1 USD
@@ -284,10 +279,10 @@ contract Minter is Context, ReentrancyGuard {
         uint256 _priceLowerBound = _oneUSD - _priceTolerance;
 
         require(_latestPrice <= _priceUpperBound && _latestPrice >= _priceLowerBound, "oracle-price-exceed-tolerance");
+        uint256 _actualAmountIn = mintingFee > 0 ? (_amountIn * (MAX_BPS - mintingFee)) / MAX_BPS : _amountIn;
+        _mintage = _latestPrice > _oneUSD ? _actualAmountIn : (_actualAmountIn * _latestPrice) / _oneUSD;
 
-        uint256 _actualAmountIn = (_amountIn * (MAX_BPS - mintingFee)) / MAX_BPS;
-        _mintage = (_actualAmountIn * _latestPrice) / _oneUSD;
-        _mintage = _mintage * 10**(18 - IERC20Metadata(_token).decimals());
+        _mintage = _mintage * 10**(vusdDecimals - IERC20Metadata(_token).decimals());
         uint256 _availableMintage = availableMintage();
         require(_availableMintage >= _mintage, "mint-limit-reached");
     }

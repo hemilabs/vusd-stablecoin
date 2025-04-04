@@ -12,20 +12,24 @@ import "./interfaces/ITreasury.sol";
 /// @title VUSD Redeemer, User can redeem their VUSD with any supported tokens
 contract Redeemer is Context, ReentrancyGuard {
     string public constant NAME = "VUSD-Redeemer";
-    string public constant VERSION = "1.4.0";
+    string public constant VERSION = "1.4.2";
 
     IVUSD public immutable vusd;
+    uint8 public immutable vusdDecimals;
 
     uint256 public redeemFee = 30; // Default 0.3% fee
     uint256 public constant MAX_REDEEM_FEE = 10_000; // 10_000 = 100%
     uint256 public priceTolerance = 100; // Default 1% based on BPS
+    uint256 public stalePeriod = 1 days;
 
     event UpdatedRedeemFee(uint256 previousRedeemFee, uint256 newRedeemFee);
     event UpdatedPriceTolerance(uint256 previousTolerance, uint256 newTolerance);
+    event UpdatedStalePeriod(uint256 previousStalePeriod, uint256 newStalePeriod);
 
     constructor(address _vusd) {
         require(_vusd != address(0), "vusd-address-is-zero");
         vusd = IVUSD(_vusd);
+        vusdDecimals = IERC20Metadata(_vusd).decimals();
     }
 
     modifier onlyGovernor() {
@@ -53,16 +57,16 @@ contract Redeemer is Context, ReentrancyGuard {
         emit UpdatedPriceTolerance(_previousTolerance, _newTolerance);
     }
 
-    ///////////////////////////////////////////////////////////////////////////
-
-    /**
-     * @notice Redeem token and burn VUSD amount less redeem fee, if any.
-     * @param _token Token to redeem, it should be 1 of the supported tokens from treasury.
-     * @param _vusdAmount VUSD amount to burn
-     */
-    function redeem(address _token, uint256 _vusdAmount) external nonReentrant {
-        _redeem(_token, _vusdAmount, _msgSender());
+    /// @notice Update stale period
+    function updateStalePeriod(uint256 _newStalePeriod) external onlyGovernor {
+        require(_newStalePeriod > 0, "stale-period-is-invalid");
+        uint256 _currentStalePeriod = stalePeriod;
+        require(_currentStalePeriod != _newStalePeriod, "same-stale-period");
+        emit UpdatedStalePeriod(_currentStalePeriod, _newStalePeriod);
+        stalePeriod = _newStalePeriod;
     }
+
+    ///////////////////////////////////////////////////////////////////////////
 
     /**
      * @notice Redeem token and burn VUSD amount less redeem fee, if any.
@@ -73,9 +77,10 @@ contract Redeemer is Context, ReentrancyGuard {
     function redeem(
         address _token,
         uint256 _vusdAmount,
+        uint256 _minAmountOut,
         address _tokenReceiver
     ) external nonReentrant {
-        _redeem(_token, _vusdAmount, _tokenReceiver);
+        _redeem(_token, _vusdAmount, _minAmountOut, _tokenReceiver);
     }
 
     /**
@@ -112,9 +117,11 @@ contract Redeemer is Context, ReentrancyGuard {
     function _redeem(
         address _token,
         uint256 _vusdAmount,
+        uint256 _minAmountOut,
         address _tokenReceiver
     ) internal {
         uint256 _redeemable = _calculateRedeemable(_token, _vusdAmount);
+        require(_redeemable >= _minAmountOut, "redeemable-amount-is-less-than-minimum");
         vusd.burnFrom(_msgSender(), _vusdAmount);
         ITreasury(treasury()).withdraw(_token, _redeemable, _tokenReceiver);
     }
@@ -126,6 +133,9 @@ contract Redeemer is Context, ReentrancyGuard {
      */
     function _calculateRedeemable(address _token, uint256 _vusdAmount) internal view returns (uint256) {
         IAggregatorV3 _oracle = IAggregatorV3(ITreasury(treasury()).oracles(_token));
+        (, int256 _price, , uint256 _updatedAt, ) = IAggregatorV3(_oracle).latestRoundData();
+        require(block.timestamp - _updatedAt < stalePeriod, "oracle-price-is-stale");
+        uint256 _latestPrice = uint256(_price);
         uint8 _oracleDecimal = IAggregatorV3(_oracle).decimals();
 
         // Token is expected to be stable coin only. Ideal price is 1 USD
@@ -134,16 +144,13 @@ contract Redeemer is Context, ReentrancyGuard {
         uint256 _priceUpperBound = _oneUSD + _tolerance;
         uint256 _priceLowerBound = _oneUSD - _tolerance;
 
-        (, int256 _price, , , ) = IAggregatorV3(_oracle).latestRoundData();
-        uint256 _latestPrice = uint256(_price);
         require(_latestPrice <= _priceUpperBound && _latestPrice >= _priceLowerBound, "price-tolerance-exceeded");
-
-        uint256 _redeemable = (_vusdAmount * _latestPrice) / _oneUSD;
+        uint256 _redeemable = _latestPrice < _oneUSD ? _vusdAmount : (_vusdAmount * _oneUSD) / _latestPrice;
         uint256 _redeemFee = redeemFee;
         if (_redeemFee != 0) {
             _redeemable -= (_redeemable * _redeemFee) / MAX_REDEEM_FEE;
         }
         // convert redeemable to _token defined decimal
-        return _redeemable / 10**(18 - IERC20Metadata(_token).decimals());
+        return _redeemable / 10**(vusdDecimals - IERC20Metadata(_token).decimals());
     }
 }
